@@ -1,19 +1,26 @@
-// Webview entry: boots Cytoscape, wires the toolbar, and handles the
-// postMessage protocol with the extension host.
-
 import './styles.css';
-import { CytoscapeManager, BreadcrumbItem } from './CytoscapeManager';
+import { CytoscapeManager, BreadcrumbItem, ViewState } from './CytoscapeManager';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../src/shared/types';
 
 interface VsCodeApi {
   postMessage(msg: WebviewToExtensionMessage): void;
+  getState(): ViewState | undefined;
+  setState(state: ViewState): void;
 }
 declare function acquireVsCodeApi(): VsCodeApi;
 
 const vscode = acquireVsCodeApi();
 
+// Restored across webview reloads; merged with the live graph on each refresh.
+let savedState: Partial<ViewState> = vscode.getState() ?? {};
+
 function post(msg: WebviewToExtensionMessage): void {
   vscode.postMessage(msg);
+}
+
+function saveState(state: ViewState): void {
+  savedState = state;
+  vscode.setState(state);
 }
 
 function setStatus(text: string): void {
@@ -57,8 +64,20 @@ function renderBreadcrumb(path: BreadcrumbItem[]): void {
   });
 }
 
-const manager = new CytoscapeManager(container, renderBreadcrumb);
+const manager = new CytoscapeManager(container, {
+  onSelect: renderBreadcrumb,
+  onStateChange: saveState,
+});
 renderBreadcrumb([]);
+
+const importsToggle = document.getElementById('imports-toggle') as HTMLInputElement | null;
+const callsToggle = document.getElementById('calls-toggle') as HTMLInputElement | null;
+if (importsToggle && savedState.importsVisible !== undefined) {
+  importsToggle.checked = savedState.importsVisible;
+}
+if (callsToggle && savedState.callsVisible !== undefined) {
+  callsToggle.checked = savedState.callsVisible;
+}
 
 document.getElementById('refresh')?.addEventListener('click', () => {
   setStatus('refreshing…');
@@ -85,7 +104,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionToWebviewMessag
   switch (msg.type) {
     case 'graph': {
       const { nodes, edges } = msg.payload;
-      manager.setGraph(msg.payload);
+      manager.setGraph(msg.payload, savedState);
       const files = nodes.filter((n) => n.type === 'file').length;
       setStatus(`${files} files · ${nodes.length} nodes · ${edges.length} edges`);
       break;

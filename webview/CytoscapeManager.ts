@@ -1,11 +1,12 @@
-// Owns the Cytoscape instance: a Logseq-style force-directed look (fcose
-// layout, degree-sized circular leaves, hover-focus that highlights a node's
-// neighborhood and dims the rest) layered on the collapse/expand model.
+// webview/CytoscapeManager.ts
+// Force-directed (fcose) Logseq-style view over the collapse/expand model.
+// Elements are added lazily: only file nodes + their import edges up front; a
+// node's children are materialized the first time it is expanded, so a large
+// repo's canvas only ever holds what the user has drilled into.
 
 import cytoscape, { Core, NodeSingular, ElementDefinition, Collection } from 'cytoscape';
 import fcose from 'cytoscape-fcose';
-import type { RepoGraph } from '../src/shared/types';
-import { toElements } from './GraphAdapter';
+import type { RepoGraph, GraphNode, GraphEdge } from '../src/shared/types';
 
 cytoscape.use(fcose);
 
@@ -21,17 +22,44 @@ export interface BreadcrumbItem {
   type: string;
 }
 
+/** Persisted UI state (survives refresh and webview reload). */
+export interface ViewState {
+  expanded: string[];
+  importsVisible: boolean;
+  callsVisible: boolean;
+}
+
+export interface ManagerOptions {
+  onSelect?: (path: BreadcrumbItem[]) => void;
+  onStateChange?: (state: ViewState) => void;
+}
+
 export class CytoscapeManager {
   private cy: Core;
+
+  // Full graph data (plain objects), indexed for lazy element creation.
+  private nodeById = new Map<string, GraphNode>();
+  private childrenByParent = new Map<string, GraphNode[]>();
+  private renderEdges: GraphEdge[] = []; // non-contains edges (imports/calls)
+  private edgesByEndpoint = new Map<string, GraphEdge[]>();
+  private degreeById = new Map<string, number>();
+
+  // What currently exists in the Cytoscape instance.
+  private added = new Set<string>();
+  private addedEdges = new Set<string>();
+
   /** Node IDs whose children are currently shown. Files collapsed by default. */
   private expanded = new Set<string>();
   private importsVisible = true;
   private callsVisible = false;
 
-  constructor(
-    container: HTMLElement,
-    private readonly onSelect?: (path: BreadcrumbItem[]) => void
-  ) {
+  private readonly onSelect?: (path: BreadcrumbItem[]) => void;
+  private readonly onStateChange?: (state: ViewState) => void;
+
+  constructor(container: HTMLElement, opts: ManagerOptions = {}) {
+    this.onSelect = opts.onSelect;
+    this.onStateChange = opts.onStateChange;
+
     this.cy = cytoscape({
       container,
       style: this.buildStyle(),
@@ -43,110 +71,264 @@ export class CytoscapeManager {
     this.cy.on('tap', 'node', (evt) => {
       const node = evt.target as NodeSingular;
       this.select(node);
-      if (node.isParent()) {
+      if (this.childrenByParent.has(node.id())) {
         this.toggle(node.id());
       }
     });
 
-    // Logseq-style hover focus: spotlight the hovered node's neighborhood.
     this.cy.on('mouseover', 'node', (evt) => this.focus(evt.target as NodeSingular));
     this.cy.on('mouseout', 'node', () => this.clearFocus());
   }
 
-  /** Replace the graph: start fully collapsed (file-level nodes only). */
-  setGraph(graph: RepoGraph): void {
-    const elements = toElements(graph);
+  /** Replace the graph. Restores prior expand/toggle state when provided. */
+  setGraph(graph: RepoGraph, saved?: Partial<ViewState>): void {
+    this.index(graph);
+
+    if (saved?.importsVisible !== undefined) {
+      this.importsVisible = saved.importsVisible;
+    }
+    if (saved?.callsVisible !== undefined) {
+      this.callsVisible = saved.callsVisible;
+    }
+    // Keep only expanded ids that still exist (stable-id match across refresh).
+    const wanted = new Set((saved?.expanded ?? [...this.expanded]).filter((id) => this.nodeById.has(id)));
+
     this.cy.elements().remove();
-    this.cy.add(elements as ElementDefinition[]);
-    // Size leaves by connectivity (degree) — the Logseq signature look.
-    this.cy.batch(() => {
-      this.cy.nodes().forEach((n) => {
-        n.data('deg', n.degree(false));
-      });
-    });
+    this.added.clear();
+    this.addedEdges.clear();
     this.expanded.clear();
+
+    this.cy.startBatch();
+    // File nodes (the always-visible top level).
+    for (const node of this.nodeById.values()) {
+      if (node.parentId === null) {
+        this.addNode(node);
+      }
+    }
+    // Restore expansion (parents before children: sort by ancestor depth).
+    for (const id of [...wanted].sort((a, b) => this.depth(a) - this.depth(b))) {
+      this.expanded.add(id);
+      this.ensureChildren(id);
+    }
+    this.cy.endBatch();
+
     this.applyVisibility();
     this.relayout(true, false, true); // instant, randomized first render
     this.onSelect?.([]);
+    this.notifyState();
   }
 
   expandAll(): void {
-    this.cy.nodes().forEach((n) => {
-      if (n.isParent()) {
-        this.expanded.add(n.id());
-      }
-    });
+    this.cy.startBatch();
+    for (const parentId of this.childrenByParent.keys()) {
+      this.expanded.add(parentId);
+      this.ensureChildren(parentId);
+    }
+    this.cy.endBatch();
     this.applyVisibility();
     this.relayout(true, true, true);
+    this.notifyState();
   }
 
   collapseAll(): void {
     this.expanded.clear();
     this.applyVisibility();
     this.relayout(true, true, true);
+    this.notifyState();
   }
 
-  /** Highlight a node by id, expand to reveal it, center the viewport on it. */
+  setImportsVisible(visible: boolean): void {
+    this.importsVisible = visible;
+    this.cy.edges('[type = "imports"]').style('display', visible ? 'element' : 'none');
+    this.notifyState();
+  }
+
+  setCallsVisible(visible: boolean): void {
+    this.callsVisible = visible;
+    this.cy.edges('[type = "calls"]').style('display', visible ? 'element' : 'none');
+    this.notifyState();
+  }
+
+  /** Highlight a node by id, reveal it (adding + expanding ancestors), center. */
   centerOn(id: string): void {
-    const node = this.cy.getElementById(id);
-    if (node.empty()) {
+    if (!this.nodeById.has(id)) {
       return;
     }
-    this.expandAncestors(id);
+    this.reveal(id);
     this.applyVisibility();
     this.relayout(false, false);
+    const node = this.cy.getElementById(id);
     this.select(node);
     this.cy.animate({ center: { eles: node }, zoom: Math.max(this.cy.zoom(), 0.8) }, { duration: 400 });
   }
 
-  /** Substring search: reveal + highlight matching nodes, dim the rest. */
+  /** Substring search over the full graph: reveal + highlight matches, dim rest. */
   search(term: string): void {
     this.cy.elements().removeClass('search-hit search-dim');
     const t = term.trim().toLowerCase();
     if (!t) {
       return;
     }
-    const matches = this.cy
-      .nodes()
-      .filter((n) => String(n.data('label')).toLowerCase().includes(t));
-    if (matches.empty()) {
+    const matchIds: string[] = [];
+    for (const node of this.nodeById.values()) {
+      if (node.label.toLowerCase().includes(t)) {
+        matchIds.push(node.id);
+      }
+    }
+    if (matchIds.length === 0) {
       this.cy.nodes().addClass('search-dim');
       return;
     }
-    // Reveal matches that are nested inside collapsed containers.
-    matches.forEach((n) => this.expandAncestors(n.id()));
+    this.cy.startBatch();
+    for (const id of matchIds) {
+      this.reveal(id);
+    }
+    this.cy.endBatch();
     this.applyVisibility();
     this.relayout(false, false);
 
+    let matches = this.cy.collection();
+    for (const id of matchIds) {
+      matches = matches.union(this.cy.getElementById(id));
+    }
     this.cy.batch(() => {
       this.cy.elements().addClass('search-dim');
       matches.union(matches.ancestors()).removeClass('search-dim');
       matches.addClass('search-hit');
     });
     this.cy.animate({ fit: { eles: matches, padding: 60 } }, { duration: 400 });
+    this.notifyState();
   }
 
-  setImportsVisible(visible: boolean): void {
-    this.importsVisible = visible;
-    this.cy.edges('[type = "imports"]').style('display', visible ? 'element' : 'none');
+  // ---- lazy element creation ------------------------------------------
+
+  private index(graph: RepoGraph): void {
+    this.nodeById.clear();
+    this.childrenByParent.clear();
+    this.edgesByEndpoint.clear();
+    this.degreeById.clear();
+    this.renderEdges = [];
+
+    for (const node of graph.nodes) {
+      this.nodeById.set(node.id, node);
+      if (node.parentId) {
+        const arr = this.childrenByParent.get(node.parentId);
+        if (arr) {
+          arr.push(node);
+        } else {
+          this.childrenByParent.set(node.parentId, [node]);
+        }
+      }
+    }
+
+    for (const edge of graph.edges) {
+      // Degree (Logseq sizing) counts every relationship, contains included.
+      bump(this.degreeById, edge.sourceId);
+      bump(this.degreeById, edge.targetId);
+      if (edge.type === 'contains') {
+        continue;
+      }
+      this.renderEdges.push(edge);
+      pushEdge(this.edgesByEndpoint, edge.sourceId, edge);
+      pushEdge(this.edgesByEndpoint, edge.targetId, edge);
+    }
   }
 
-  setCallsVisible(visible: boolean): void {
-    this.callsVisible = visible;
-    this.cy.edges('[type = "calls"]').style('display', visible ? 'element' : 'none');
+  private addNode(node: GraphNode): void {
+    if (this.added.has(node.id)) {
+      return;
+    }
+    this.cy.add({
+      group: 'nodes',
+      data: {
+        id: node.id,
+        label: node.label,
+        type: node.type,
+        parent: node.parentId ?? undefined,
+        deg: this.degreeById.get(node.id) ?? 0,
+        filePath: node.filePath,
+        startLine: node.lineRange?.start ?? null,
+        endLine: node.lineRange?.end ?? null,
+      },
+    } as ElementDefinition);
+    this.added.add(node.id);
+
+    // Add any edges whose other endpoint is already present.
+    for (const edge of this.edgesByEndpoint.get(node.id) ?? []) {
+      const other = edge.sourceId === node.id ? edge.targetId : edge.sourceId;
+      if (this.added.has(other)) {
+        this.addEdge(edge);
+      }
+    }
   }
+
+  private addEdge(edge: GraphEdge): void {
+    if (this.addedEdges.has(edge.id)) {
+      return;
+    }
+    const visible = edge.type === 'calls' ? this.callsVisible : this.importsVisible;
+    this.cy.add({
+      group: 'edges',
+      data: {
+        id: edge.id,
+        source: edge.sourceId,
+        target: edge.targetId,
+        type: edge.type,
+        label: edge.label ?? '',
+      },
+      style: visible ? undefined : { display: 'none' },
+    } as ElementDefinition);
+    this.addedEdges.add(edge.id);
+  }
+
+  private ensureChildren(parentId: string): void {
+    for (const child of this.childrenByParent.get(parentId) ?? []) {
+      this.addNode(child);
+    }
+  }
+
+  /** Add elements + expand ancestors so node `id` becomes visible. */
+  private reveal(id: string): void {
+    const chain: string[] = [];
+    let cur: string | null = id;
+    while (cur) {
+      chain.unshift(cur);
+      cur = this.nodeById.get(cur)?.parentId ?? null;
+    }
+    // Walk root -> id, expanding + materializing children along the way.
+    for (let i = 0; i < chain.length; i++) {
+      this.addNode(this.nodeById.get(chain[i])!);
+      if (i < chain.length - 1) {
+        this.expanded.add(chain[i]);
+        this.ensureChildren(chain[i]);
+      }
+    }
+  }
+
+  private depth(id: string): number {
+    let d = 0;
+    let cur = this.nodeById.get(id)?.parentId ?? null;
+    while (cur) {
+      d++;
+      cur = this.nodeById.get(cur)?.parentId ?? null;
+    }
+    return d;
+  }
+
+  // ---- interaction -----------------------------------------------------
 
   private toggle(id: string): void {
     if (this.expanded.has(id)) {
       this.expanded.delete(id);
     } else {
       this.expanded.add(id);
+      this.ensureChildren(id);
     }
     this.applyVisibility();
     this.relayout(false);
+    this.notifyState();
   }
 
-  /** Mark a node selected and emit its ancestor path for the breadcrumb. */
   private select(node: NodeSingular): void {
     this.cy.nodes('.selected').removeClass('selected');
     node.addClass('selected');
@@ -155,24 +337,16 @@ export class CytoscapeManager {
 
   private emitBreadcrumb(id: string): void {
     const path: BreadcrumbItem[] = [];
-    let cur: string | undefined = id;
+    let cur: string | null = id;
     while (cur) {
-      const n = this.cy.getElementById(cur);
-      if (n.empty()) {
+      const node = this.nodeById.get(cur);
+      if (!node) {
         break;
       }
-      path.unshift({ id: cur, label: String(n.data('label')), type: String(n.data('type')) });
-      cur = n.data('parent') as string | undefined;
+      path.unshift({ id: node.id, label: node.label, type: node.type });
+      cur = node.parentId;
     }
     this.onSelect?.(path);
-  }
-
-  private expandAncestors(id: string): void {
-    let p = this.cy.getElementById(id).data('parent') as string | undefined;
-    while (p) {
-      this.expanded.add(p);
-      p = this.cy.getElementById(p).data('parent') as string | undefined;
-    }
   }
 
   private focus(node: NodeSingular): void {
@@ -196,31 +370,27 @@ export class CytoscapeManager {
   private applyVisibility(): void {
     this.cy.batch(() => {
       this.cy.nodes().forEach((n) => {
-        n.style('display', this.isVisible(n) ? 'element' : 'none');
+        n.style('display', this.isVisible(n.id()) ? 'element' : 'none');
       });
-      this.cy
-        .edges('[type = "imports"]')
-        .style('display', this.importsVisible ? 'element' : 'none');
-      this.cy
-        .edges('[type = "calls"]')
-        .style('display', this.callsVisible ? 'element' : 'none');
+      this.cy.edges('[type = "imports"]').style('display', this.importsVisible ? 'element' : 'none');
+      this.cy.edges('[type = "calls"]').style('display', this.callsVisible ? 'element' : 'none');
     });
   }
 
-  private isVisible(node: NodeSingular): boolean {
-    let parent = node.data('parent') as string | undefined;
+  private isVisible(id: string): boolean {
+    let parent = this.nodeById.get(id)?.parentId ?? null;
     while (parent) {
       if (!this.expanded.has(parent)) {
         return false;
       }
-      parent = this.cy.getElementById(parent).data('parent') as string | undefined;
+      parent = this.nodeById.get(parent)?.parentId ?? null;
     }
     return true;
   }
 
   private relayout(fit: boolean, animate = true, randomize = false): void {
-    const visible = this.cy.elements(':visible');
-    visible
+    this.cy
+      .elements(':visible')
       .layout({
         name: 'fcose',
         quality: 'default',
@@ -241,6 +411,14 @@ export class CytoscapeManager {
       .run();
   }
 
+  private notifyState(): void {
+    this.onStateChange?.({
+      expanded: [...this.expanded],
+      importsVisible: this.importsVisible,
+      callsVisible: this.callsVisible,
+    });
+  }
+
   private buildStyle(): cytoscape.StylesheetStyle[] {
     const fg = themeColor('--vscode-foreground', '#ccc');
     const bg = themeColor('--vscode-editor-background', '#1e1e1e');
@@ -252,7 +430,6 @@ export class CytoscapeManager {
     const importColor = themeColor('--vscode-charts-foreground', '#8a8a8a');
     const hitColor = themeColor('--vscode-charts-yellow', '#e2c08d');
 
-    // Degree -> diameter mapping for leaf nodes (Logseq-style sizing).
     const sizeByDegree = 'mapData(deg, 0, 10, 14, 46)';
 
     return [
@@ -275,24 +452,11 @@ export class CytoscapeManager {
           height: sizeByDegree,
         },
       },
+      { selector: 'node[type = "file"]', style: { shape: 'ellipse', 'background-color': fileColor } },
+      { selector: 'node[type = "class"]', style: { shape: 'ellipse', 'background-color': classColor } },
+      { selector: 'node[type = "function"]', style: { shape: 'ellipse', 'background-color': fnColor } },
+      { selector: 'node[type = "method"]', style: { shape: 'ellipse', 'background-color': methodColor } },
       {
-        selector: 'node[type = "file"]',
-        style: { shape: 'ellipse', 'background-color': fileColor },
-      },
-      {
-        selector: 'node[type = "class"]',
-        style: { shape: 'ellipse', 'background-color': classColor },
-      },
-      {
-        selector: 'node[type = "function"]',
-        style: { shape: 'ellipse', 'background-color': fnColor },
-      },
-      {
-        selector: 'node[type = "method"]',
-        style: { shape: 'ellipse', 'background-color': methodColor },
-      },
-      {
-        // Expanded container nodes: faint hull around children, label on top.
         selector: ':parent',
         style: {
           shape: 'round-rectangle',
@@ -320,19 +484,10 @@ export class CytoscapeManager {
         },
       },
       {
-        // calls edges: red dashed, distinct from imports.
         selector: 'edge[type = "calls"]',
-        style: {
-          'line-color': '#e06c75',
-          'line-style': 'dashed',
-          'target-arrow-color': '#e06c75',
-        },
+        style: { 'line-color': '#e06c75', 'line-style': 'dashed', 'target-arrow-color': '#e06c75' },
       },
-      // Hover-focus states.
-      {
-        selector: '.dim',
-        style: { opacity: 0.12 },
-      },
+      { selector: '.dim', style: { opacity: 0.12 } },
       {
         selector: 'node.focus',
         style: { 'border-width': 2, 'border-color': fileColor, 'border-opacity': 1 },
@@ -341,16 +496,11 @@ export class CytoscapeManager {
         selector: 'edge.focus',
         style: { width: 2, 'line-opacity': 1, 'line-color': fileColor, 'target-arrow-color': fileColor },
       },
-      // Selection (breadcrumb / centerOn target).
       {
         selector: 'node.selected',
         style: { 'border-width': 3, 'border-color': fileColor, 'border-opacity': 1 },
       },
-      // Search states.
-      {
-        selector: '.search-dim',
-        style: { opacity: 0.08 },
-      },
+      { selector: '.search-dim', style: { opacity: 0.08 } },
       {
         selector: 'node.search-hit',
         style: {
@@ -362,5 +512,18 @@ export class CytoscapeManager {
         },
       },
     ];
+  }
+}
+
+function bump(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function pushEdge(map: Map<string, GraphEdge[]>, key: string, edge: GraphEdge): void {
+  const arr = map.get(key);
+  if (arr) {
+    arr.push(edge);
+  } else {
+    map.set(key, [edge]);
   }
 }
