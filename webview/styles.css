@@ -118,3 +118,70 @@ body {
   right: 0;
   bottom: 0;
 }
+
+#snippet {
+  position: absolute;
+  top: 60px;
+  right: 0;
+  bottom: 0;
+  width: 38%;
+  min-width: 280px;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-editor-background);
+  border-left: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  box-shadow: -2px 0 8px rgba(0, 0, 0, 0.25);
+  z-index: 11;
+}
+
+/* [hidden] alone is overridden by display:flex, so hide explicitly. */
+#snippet[hidden] {
+  display: none;
+}
+
+#snippet-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 8px 0 10px;
+  background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+}
+
+#snippet-title {
+  flex: 1;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#snippet-close {
+  background: transparent;
+  border: none;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 2px;
+}
+
+#snippet-close:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+#snippet-code {
+  flex: 1;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--vscode-editor-font-size, 12px);
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 4;
+}
