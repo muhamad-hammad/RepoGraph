@@ -15,6 +15,19 @@ function themeColor(name: string, fallback: string): string {
   return v || fallback;
 }
 
+// Ambient "constellation" tuning — gathered here so the look is easy to retune.
+const AMBIENT_BG = '#050505';
+const NODE_SIZE = 5;
+const FILE_NODE_SIZE = 10;
+const LAYOUT_NODE_REPULSION = 12000;
+const LAYOUT_IDEAL_EDGE_LENGTH = 130;
+const LAYOUT_GRAVITY = 0.03;
+const LAYOUT_NODE_SEPARATION = 12;
+const LAYOUT_ANIMATION_DURATION = 1500;
+const DRIFT_INTERVAL_MS = 60;
+const DRIFT_AMPLITUDE = 0.5; // px per tick, per axis
+const DRIFT_RESUME_MS = 300; // idle gap before drift resumes after interaction
+
 /** One step in a node's ancestor path (file ▸ class ▸ method). */
 export interface BreadcrumbItem {
   id: string;
@@ -40,12 +53,9 @@ export class CytoscapeManager {
   // Full graph data (plain objects), indexed for lazy element creation.
   private nodeById = new Map<string, GraphNode>();
   private childrenByParent = new Map<string, GraphNode[]>();
-  private renderEdges: GraphEdge[] = []; // non-contains edges (imports/calls)
   private edgesByEndpoint = new Map<string, GraphEdge[]>();
-  private degreeById = new Map<string, number>();
-  private orderById = new Map<string, number>(); // per-file reading order (1-based)
+  private orderById = new Map<string, number>(); // global check order (1-based)
 
-  // What currently exists in the Cytoscape instance.
   private added = new Set<string>();
   private addedEdges = new Set<string>();
 
@@ -57,9 +67,16 @@ export class CytoscapeManager {
   private readonly onSelect?: (path: BreadcrumbItem[]) => void;
   private readonly onStateChange?: (state: ViewState) => void;
 
+  // Ambient idle drift: nudges nodes continuously once the layout has settled.
+  private driftTimer: number | null = null;
+  private resumeTimer: number | null = null;
+  private interacting = false;
+
   constructor(container: HTMLElement, opts: ManagerOptions = {}) {
     this.onSelect = opts.onSelect;
     this.onStateChange = opts.onStateChange;
+
+    container.style.background = AMBIENT_BG;
 
     this.cy = cytoscape({
       container,
@@ -79,6 +96,9 @@ export class CytoscapeManager {
 
     this.cy.on('mouseover', 'node', (evt) => this.focus(evt.target as NodeSingular));
     this.cy.on('mouseout', 'node', () => this.clearFocus());
+
+    // Hold the drift while the user drags, pans, or zooms; resume once idle.
+    this.cy.on('mousedown grab drag pan zoom', () => this.suspendDrift());
   }
 
   /** Replace the graph. Restores prior expand/toggle state when provided. */
@@ -100,7 +120,6 @@ export class CytoscapeManager {
     this.expanded.clear();
 
     this.cy.startBatch();
-    // File nodes (the always-visible top level).
     for (const node of this.nodeById.values()) {
       if (node.parentId === null) {
         this.addNode(node);
@@ -150,7 +169,7 @@ export class CytoscapeManager {
     const { scale = 3, full = false } = opts;
     return this.cy.png({
       output: 'base64uri',
-      bg: themeColor('--vscode-editor-background', '#1e1e1e'),
+      bg: AMBIENT_BG,
       full,
       scale,
       maxWidth: 12000,
@@ -227,9 +246,7 @@ export class CytoscapeManager {
     this.nodeById.clear();
     this.childrenByParent.clear();
     this.edgesByEndpoint.clear();
-    this.degreeById.clear();
     this.orderById.clear();
-    this.renderEdges = [];
 
     for (const node of graph.nodes) {
       this.nodeById.set(node.id, node);
@@ -243,11 +260,12 @@ export class CytoscapeManager {
       }
     }
 
-    // Number definitions in reading order: per file, top-to-bottom by start line.
+    // Number every node in one global "check this next" sequence: walk files in
+    // graph order, and within each file its definitions top-to-bottom by line.
     const defsByFile = new Map<string, GraphNode[]>();
     for (const node of this.nodeById.values()) {
-      if (!node.lineRange) {
-        continue; // file nodes carry no range and stay unnumbered
+      if (node.parentId === null || !node.lineRange) {
+        continue; // file roots are numbered inline below
       }
       const fileId = this.fileRootOf(node.id);
       const arr = defsByFile.get(fileId);
@@ -257,19 +275,25 @@ export class CytoscapeManager {
         defsByFile.set(fileId, [node]);
       }
     }
-    for (const defs of defsByFile.values()) {
-      defs.sort((a, b) => a.lineRange!.start - b.lineRange!.start);
-      defs.forEach((n, i) => this.orderById.set(n.id, i + 1));
+    let order = 0;
+    for (const node of graph.nodes) {
+      if (node.parentId !== null) {
+        continue;
+      }
+      this.orderById.set(node.id, ++order);
+      const defs = defsByFile.get(node.id);
+      if (defs) {
+        defs.sort((a, b) => a.lineRange!.start - b.lineRange!.start);
+        for (const def of defs) {
+          this.orderById.set(def.id, ++order);
+        }
+      }
     }
 
     for (const edge of graph.edges) {
-      // Degree (Logseq sizing) counts every relationship, contains included.
-      bump(this.degreeById, edge.sourceId);
-      bump(this.degreeById, edge.targetId);
       if (edge.type === 'contains') {
         continue;
       }
-      this.renderEdges.push(edge);
       pushEdge(this.edgesByEndpoint, edge.sourceId, edge);
       pushEdge(this.edgesByEndpoint, edge.targetId, edge);
     }
@@ -287,7 +311,6 @@ export class CytoscapeManager {
         label: order ? `${order}. ${node.label}` : node.label,
         type: node.type,
         parent: node.parentId ?? undefined,
-        deg: this.degreeById.get(node.id) ?? 0,
         filePath: node.filePath,
         startLine: node.lineRange?.start ?? null,
         endLine: node.lineRange?.end ?? null,
@@ -439,30 +462,74 @@ export class CytoscapeManager {
   }
 
   private relayout(fit: boolean, animate = true, randomize = false): void {
-    this.cy
-      .elements(':visible')
-      .layout({
-        name: 'fcose',
-        quality: 'default',
-        animate,
-        animationDuration: 500,
-        animationEasing: 'ease-out',
-        randomize,
-        fit,
-        padding: 60,
-        // Spread the compound boxes: high separation + repulsion push containers
-        // apart, while strong compound gravity keeps each box's children tight so
-        // boxes stay compact and don't overlap their neighbors.
-        nodeSeparation: 180,
-        idealEdgeLength: () => 140,
-        nodeRepulsion: () => 18000,
-        gravity: 0.15,
-        gravityCompound: 2.0,
-        gravityRangeCompound: 2.0,
-        nestingFactor: 0.2,
-        packComponents: true,
-      } as cytoscape.LayoutOptions)
-      .run();
+    this.stopDrift();
+    const layout = this.cy.elements(':visible').layout({
+      name: 'fcose',
+      quality: 'default',
+      animate,
+      animationDuration: LAYOUT_ANIMATION_DURATION,
+      animationEasing: 'ease-out',
+      randomize,
+      fit,
+      padding: 60,
+      // Loose, evenly-spread cloud at the top level, but each compound hugs its
+      // children: strong compound gravity + tight tiling/nesting/separation pull
+      // a file's defs together so boxes are only as big as their contents.
+      nodeSeparation: LAYOUT_NODE_SEPARATION,
+      idealEdgeLength: () => LAYOUT_IDEAL_EDGE_LENGTH,
+      nodeRepulsion: () => LAYOUT_NODE_REPULSION,
+      gravity: LAYOUT_GRAVITY,
+      gravityCompound: 30.0,
+      gravityRangeCompound: 1.2,
+      nestingFactor: 0.06,
+      tile: true,
+      tilingPaddingVertical: 4,
+      tilingPaddingHorizontal: 4,
+      packComponents: false,
+    } as cytoscape.LayoutOptions);
+    layout.one('layoutstop', () => this.startDrift());
+    layout.run();
+  }
+
+  // ---- ambient idle drift ----------------------------------------------
+
+  private startDrift(): void {
+    this.stopDrift();
+    this.driftTimer = window.setInterval(() => {
+      if (this.interacting) {
+        return;
+      }
+      this.cy.batch(() => {
+        this.cy.nodes(':visible').forEach((n) => {
+          if (!n.isChildless() || n.grabbed()) {
+            return; // drift only the leaf "stars"; parents follow their children
+          }
+          const p = n.position();
+          n.position({
+            x: p.x + (Math.random() - 0.5) * 2 * DRIFT_AMPLITUDE,
+            y: p.y + (Math.random() - 0.5) * 2 * DRIFT_AMPLITUDE,
+          });
+        });
+      });
+    }, DRIFT_INTERVAL_MS);
+  }
+
+  private stopDrift(): void {
+    if (this.driftTimer !== null) {
+      clearInterval(this.driftTimer);
+      this.driftTimer = null;
+    }
+  }
+
+  private suspendDrift(): void {
+    this.interacting = true;
+    if (this.resumeTimer !== null) {
+      clearTimeout(this.resumeTimer);
+    }
+    this.resumeTimer = window.setTimeout(() => {
+      this.interacting = false;
+      this.resumeTimer = null;
+    }, DRIFT_RESUME_MS);
   }
 
   private notifyState(): void {
@@ -474,103 +541,95 @@ export class CytoscapeManager {
   }
 
   private buildStyle(): cytoscape.StylesheetStyle[] {
-    const fg = themeColor('--vscode-foreground', '#ccc');
-    const bg = themeColor('--vscode-editor-background', '#1e1e1e');
-    const border = themeColor('--vscode-panel-border', '#555');
     const fileColor = themeColor('--vscode-charts-blue', '#4daafc');
     const classColor = themeColor('--vscode-charts-orange', '#e2a45e');
     const fnColor = themeColor('--vscode-charts-green', '#89d185');
     const methodColor = themeColor('--vscode-charts-purple', '#b180d7');
-    const importColor = themeColor('--vscode-charts-foreground', '#8a8a8a');
     const hitColor = themeColor('--vscode-charts-yellow', '#e2c08d');
-
-    const sizeByDegree = 'mapData(deg, 0, 10, 14, 46)';
 
     return [
       {
         selector: 'node',
         style: {
           label: 'data(label)',
-          color: fg,
-          'font-size': 10,
+          color: '#dfe3ee',
+          'font-size': 9,
           'text-valign': 'bottom',
           'text-halign': 'center',
-          'text-margin-y': 3,
+          'text-margin-y': 4,
           'text-wrap': 'ellipsis',
           'text-max-width': '140px',
           'text-outline-width': 2,
-          'text-outline-color': bg,
-          'text-outline-opacity': 0.9,
+          'text-outline-color': AMBIENT_BG,
+          'text-outline-opacity': 1,
+          shape: 'ellipse',
+          'background-color': fileColor,
+          'background-opacity': 1,
           'border-width': 0,
-          width: sizeByDegree,
-          height: sizeByDegree,
+          width: NODE_SIZE,
+          height: NODE_SIZE,
         },
       },
-      { selector: 'node[type = "file"]', style: { shape: 'ellipse', 'background-color': fileColor } },
-      { selector: 'node[type = "class"]', style: { shape: 'ellipse', 'background-color': classColor } },
-      { selector: 'node[type = "function"]', style: { shape: 'ellipse', 'background-color': fnColor } },
-      { selector: 'node[type = "method"]', style: { shape: 'ellipse', 'background-color': methodColor } },
+      {
+        selector: 'node[type = "file"]',
+        style: { 'background-color': fileColor, width: FILE_NODE_SIZE, height: FILE_NODE_SIZE },
+      },
+      { selector: 'node[type = "class"]', style: { 'background-color': classColor } },
+      { selector: 'node[type = "function"]', style: { 'background-color': fnColor } },
+      { selector: 'node[type = "method"]', style: { 'background-color': methodColor } },
       {
         selector: ':parent',
         style: {
           shape: 'round-rectangle',
-          'background-opacity': 0.07,
-          'background-color': fg,
+          'background-opacity': 0.04,
+          'background-color': '#ffffff',
           'border-width': 1,
-          'border-color': border,
-          'border-opacity': 0.4,
+          'border-color': 'rgba(255,255,255,0.12)',
           'text-valign': 'top',
-          'font-size': 11,
+          'font-size': 10,
           'font-weight': 'bold',
-          padding: '16px',
+          padding: '6px',
         },
       },
       {
         selector: 'edge',
         style: {
-          width: 1,
-          'line-color': importColor,
-          'line-opacity': 0.5,
-          'curve-style': 'bezier',
-          'target-arrow-color': importColor,
-          'target-arrow-shape': 'triangle',
-          'arrow-scale': 0.7,
+          width: 0.6,
+          'line-color': 'rgba(255,255,255,0.18)',
+          'curve-style': 'straight',
+          'target-arrow-shape': 'none',
         },
       },
       {
         selector: 'edge[type = "calls"]',
-        style: { 'line-color': '#e06c75', 'line-style': 'dashed', 'target-arrow-color': '#e06c75' },
+        style: { 'line-color': 'rgba(255,180,180,0.18)', 'line-style': 'dashed' },
       },
       { selector: '.dim', style: { opacity: 0.12 } },
       {
         selector: 'node.focus',
-        style: { 'border-width': 2, 'border-color': fileColor, 'border-opacity': 1 },
+        style: { 'background-opacity': 1, 'border-width': 1, 'border-color': fileColor, 'border-opacity': 0.9 },
       },
       {
         selector: 'edge.focus',
-        style: { width: 2, 'line-opacity': 1, 'line-color': fileColor, 'target-arrow-color': fileColor },
+        style: { width: 1.2, 'line-color': fileColor, 'line-opacity': 0.9 },
       },
       {
-        selector: 'node.selected',
-        style: { 'border-width': 3, 'border-color': fileColor, 'border-opacity': 1 },
+        selector: 'node:selected, node.selected',
+        style: { 'background-opacity': 1, 'border-width': 2, 'border-color': fileColor, 'border-opacity': 1 },
       },
-      { selector: '.search-dim', style: { opacity: 0.08 } },
+      { selector: '.search-dim', style: { opacity: 0.06 } },
       {
         selector: 'node.search-hit',
         style: {
-          'border-width': 3,
+          'background-opacity': 1,
+          'border-width': 2,
           'border-color': hitColor,
           'border-opacity': 1,
-          'font-weight': 'bold',
           'z-index': 100,
         },
       },
     ];
   }
-}
-
-function bump(map: Map<string, number>, key: string): void {
-  map.set(key, (map.get(key) ?? 0) + 1);
 }
 
 function pushEdge(map: Map<string, GraphEdge[]>, key: string, edge: GraphEdge): void {
