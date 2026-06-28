@@ -1,5 +1,3 @@
-// Wraps workspace.findFiles; returns supported source files grouped by grammar key.
-
 import * as vscode from 'vscode';
 import { GrammarKey, grammarKeyForPath } from './LanguageRegistry';
 

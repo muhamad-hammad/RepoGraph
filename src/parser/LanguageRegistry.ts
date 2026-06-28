@@ -1,6 +1,3 @@
-// Loads and caches web-tree-sitter parsers + grammars per language.
-// No vscode dependency so it can run in a headless test harness.
-
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { Parser, Language } from 'web-tree-sitter';

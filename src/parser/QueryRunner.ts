@@ -1,5 +1,3 @@
-// Executes a .scm query against a parsed tree and returns structured captures.
-
 import { Query, Language, Node, Tree } from 'web-tree-sitter';
 
 export type CaptureKind = 'function' | 'class' | 'method' | 'import' | 'call';
