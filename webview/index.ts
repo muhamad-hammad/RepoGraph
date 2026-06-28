@@ -75,12 +75,16 @@ function showSnippet(s: CodeSnippet): void {
   snippetTitle.textContent = `${s.label} · ${s.relPath}:${s.startLine}-${s.endLine}`;
   snippetCode.textContent = s.code;
   snippetEl.hidden = false;
+  document.body.classList.add('snippet-open');
+  manager.resize();
 }
 
 function hideSnippet(): void {
   if (snippetEl) {
     snippetEl.hidden = true;
   }
+  document.body.classList.remove('snippet-open');
+  manager.resize();
 }
 
 document.getElementById('snippet-close')?.addEventListener('click', hideSnippet);

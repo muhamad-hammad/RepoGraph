@@ -137,6 +137,11 @@ export class CytoscapeManager {
     this.notifyState();
   }
 
+  /** Recompute viewport after the container is resized (e.g. snippet split). */
+  resize(): void {
+    this.cy.resize();
+  }
+
   setImportsVisible(visible: boolean): void {
     this.importsVisible = visible;
     this.cy.edges('[type = "imports"]').style('display', visible ? 'element' : 'none');

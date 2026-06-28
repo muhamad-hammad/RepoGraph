@@ -1,5 +1,6 @@
 :root {
   color-scheme: light dark;
+  --snippet-width: 420px;
 }
 
 html,
@@ -119,14 +120,18 @@ body {
   bottom: 0;
 }
 
+/* When the snippet panel is open, the graph yields the panel's width so the
+   two split the screen instead of overlapping. */
+body.snippet-open #cy {
+  right: var(--snippet-width);
+}
+
 #snippet {
   position: absolute;
   top: 60px;
   right: 0;
   bottom: 0;
-  width: 38%;
-  min-width: 280px;
-  max-width: 560px;
+  width: var(--snippet-width);
   display: flex;
   flex-direction: column;
   background: var(--vscode-editor-background);
