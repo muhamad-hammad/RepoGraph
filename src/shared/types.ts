@@ -51,4 +51,5 @@ export type ExtensionToWebviewMessage =
 export type WebviewToExtensionMessage =
   | { type: 'ready' }
   | { type: 'requestRefresh' }
-  | { type: 'requestSnippet'; nodeId: string };
+  | { type: 'requestSnippet'; nodeId: string }
+  | { type: 'exportFile'; data: string; ext: 'pdf' | 'png' };

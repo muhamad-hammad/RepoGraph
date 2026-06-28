@@ -102,6 +102,31 @@ export class GraphPanel {
       case 'requestSnippet':
         void this.sendSnippet(msg.nodeId);
         break;
+      case 'exportFile':
+        void this.saveExport(msg.data, msg.ext);
+        break;
+    }
+  }
+
+  /** Write a webview-built export (base64 PDF or PNG) to a user-chosen path. */
+  private async saveExport(base64: string, ext: 'pdf' | 'png'): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const stamp = new Date().toISOString().slice(0, 10);
+    const defaultUri = folder
+      ? vscode.Uri.joinPath(folder, `repo-graph-${stamp}.${ext}`)
+      : undefined;
+    const filters: Record<string, string[]> =
+      ext === 'pdf' ? { 'PDF document': ['pdf'] } : { 'PNG image': ['png'] };
+    const target = await vscode.window.showSaveDialog({ defaultUri, saveLabel: 'Export', filters });
+    if (!target) {
+      return;
+    }
+    try {
+      await fs.writeFile(target.fsPath, Buffer.from(base64, 'base64'));
+      void vscode.window.showInformationMessage(`Repo Graph exported to ${target.fsPath}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.post({ type: 'error', payload: `Could not save ${ext.toUpperCase()}: ${message}` });
     }
   }
 
