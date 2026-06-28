@@ -1,4 +1,5 @@
 import './styles.css';
+import { jsPDF } from 'jspdf';
 import { CytoscapeManager, BreadcrumbItem, ViewState } from './CytoscapeManager';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage, CodeSnippet } from '../src/shared/types';
 
@@ -121,6 +122,60 @@ document.getElementById('refresh')?.addEventListener('click', () => {
 });
 document.getElementById('expand-all')?.addEventListener('click', () => manager.expandAll());
 document.getElementById('collapse-all')?.addEventListener('click', () => manager.collapseAll());
+document.querySelectorAll<HTMLButtonElement>('#export-menu button[data-format]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const format = btn.dataset.format === 'png' ? 'png' : 'pdf';
+    const full = btn.dataset.scope === 'full';
+    const menu = document.getElementById('export-menu') as HTMLDetailsElement | null;
+    if (menu) {
+      menu.open = false;
+    }
+    void runExport(format, full);
+  });
+});
+
+// For PDF, wrap the captured PNG on a single page sized to the image's own
+// aspect ratio so nothing is scaled or cropped.
+async function runExport(format: 'pdf' | 'png', full: boolean): Promise<void> {
+  setStatus(`exporting ${format.toUpperCase()}…`);
+  try {
+    const uri = manager.exportPng({ scale: 3, full });
+    if (format === 'png') {
+      post({ type: 'exportFile', data: stripDataUri(uri), ext: 'png' });
+      setStatus('');
+      return;
+    }
+    const img = await loadImage(uri);
+    // px → pt at 96dpi (PDF user units are 1/72 inch).
+    const wPt = (img.naturalWidth * 72) / 96;
+    const hPt = (img.naturalHeight * 72) / 96;
+    const doc = new jsPDF({
+      orientation: wPt >= hPt ? 'landscape' : 'portrait',
+      unit: 'pt',
+      format: [wPt, hPt],
+    });
+    const pw = doc.internal.pageSize.getWidth();
+    const ph = doc.internal.pageSize.getHeight();
+    doc.addImage(uri, 'PNG', 0, 0, pw, ph);
+    post({ type: 'exportFile', data: stripDataUri(doc.output('datauristring')), ext: 'pdf' });
+    setStatus('');
+  } catch (err) {
+    setStatus(`export failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function stripDataUri(uri: string): string {
+  return uri.slice(uri.indexOf('base64,') + 7);
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('could not decode graph image'));
+    img.src = src;
+  });
+}
 document.getElementById('imports-toggle')?.addEventListener('change', (e) => {
   manager.setImportsVisible((e.target as HTMLInputElement).checked);
 });

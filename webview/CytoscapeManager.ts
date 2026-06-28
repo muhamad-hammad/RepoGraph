@@ -143,6 +143,21 @@ export class CytoscapeManager {
     this.cy.resize();
   }
 
+  /** Render to a base64 PNG. `full` captures the whole graph (not just the
+   * viewport); `scale` oversamples so the image stays sharp, capped to stay
+   * within browser canvas limits. */
+  exportPng(opts: { scale?: number; full?: boolean } = {}): string {
+    const { scale = 3, full = false } = opts;
+    return this.cy.png({
+      output: 'base64uri',
+      bg: themeColor('--vscode-editor-background', '#1e1e1e'),
+      full,
+      scale,
+      maxWidth: 12000,
+      maxHeight: 12000,
+    });
+  }
+
   setImportsVisible(visible: boolean): void {
     this.importsVisible = visible;
     this.cy.edges('[type = "imports"]').style('display', visible ? 'element' : 'none');
