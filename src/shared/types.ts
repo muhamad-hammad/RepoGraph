@@ -33,8 +33,22 @@ export interface RepoGraph {
   generatedAt: number;
 }
 
+// Source lines for one definition node, read on demand by the host.
+export interface CodeSnippet {
+  nodeId: string;
+  label: string;
+  relPath: string; // repo-root-relative, for display
+  startLine: number; // 1-indexed
+  endLine: number; // 1-indexed
+  code: string;
+}
+
 export type ExtensionToWebviewMessage =
   | { type: 'graph'; payload: RepoGraph }
+  | { type: 'snippet'; payload: CodeSnippet }
   | { type: 'error'; payload: string };
 
-export type WebviewToExtensionMessage = { type: 'ready' } | { type: 'requestRefresh' };
+export type WebviewToExtensionMessage =
+  | { type: 'ready' }
+  | { type: 'requestRefresh' }
+  | { type: 'requestSnippet'; nodeId: string };

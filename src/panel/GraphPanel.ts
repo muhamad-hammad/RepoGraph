@@ -99,6 +99,35 @@ export class GraphPanel {
       case 'requestRefresh':
         void this.refresh();
         break;
+      case 'requestSnippet':
+        void this.sendSnippet(msg.nodeId);
+        break;
+    }
+  }
+
+  /** Read the source lines for a definition node and push them to the webview. */
+  private async sendSnippet(nodeId: string): Promise<void> {
+    const graph = this.latestGraph;
+    if (!graph) {
+      return;
+    }
+    const node = graph.nodes.find((n) => n.id === nodeId);
+    if (!node || !node.lineRange) {
+      return; // only definition nodes (not files) have a line range
+    }
+    try {
+      const content = await fs.readFile(node.filePath, 'utf8');
+      const lines = content.split(/\r?\n/);
+      const { start, end } = node.lineRange;
+      const code = lines.slice(start - 1, end).join('\n');
+      const relPath = path.relative(graph.rootPath, node.filePath).split(path.sep).join('/');
+      this.post({
+        type: 'snippet',
+        payload: { nodeId, label: node.label, relPath, startLine: start, endLine: end, code },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.post({ type: 'error', payload: `Could not read source for ${node.label}: ${message}` });
     }
   }
 
