@@ -434,13 +434,17 @@ export class CytoscapeManager {
         animationEasing: 'ease-out',
         randomize,
         fit,
-        padding: 50,
-        nodeSeparation: 90,
-        idealEdgeLength: () => 90,
-        nodeRepulsion: () => 6000,
-        gravity: 0.25,
-        gravityCompound: 1.0,
-        nestingFactor: 0.1,
+        padding: 60,
+        // Spread the compound boxes: high separation + repulsion push containers
+        // apart, while strong compound gravity keeps each box's children tight so
+        // boxes stay compact and don't overlap their neighbors.
+        nodeSeparation: 180,
+        idealEdgeLength: () => 140,
+        nodeRepulsion: () => 18000,
+        gravity: 0.15,
+        gravityCompound: 2.0,
+        gravityRangeCompound: 2.0,
+        nestingFactor: 0.2,
         packComponents: true,
       } as cytoscape.LayoutOptions)
       .run();
